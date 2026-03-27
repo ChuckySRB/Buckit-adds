@@ -1,141 +1,189 @@
 #!/usr/bin/env python3
 """
-Buckit – Brain's External RAM  ·  Promo Video Generator v4
+Buckit - Brain's External RAM  ·  Promo Video Generator v8
 ───────────────────────────────────────────────────────────
-v4: Real tactile keyboard sounds, clean text (no outline),
-    flat dark backgrounds, bigger text, dynamic zoom tracking
-    typed word, smooth slide transitions, faster pacing.
+  • 2-scene dialogue: busy_user123 <-> buckit conversation
+  • Scene 1: Dark purple bg / lighter purple text (problem)
+  • Scene 2: Light green bg / dark green text (inverted, solution)
+  • Different colors per speaker (user vs buckit)
+  • RAM loading bar animation for user lines
+  • Glitch transition between scenes
+  • CRT scanlines
+  • Real tactile keyboard sounds + enter sound
+  • Last slide: BUCKIT_TEXT.png + subtitle + QR + blinking text
+  • Outputs: 9:16 (stories) + 4:5 (feed)
 """
 
-import os, gc, math, wave, random, struct
+import os, gc, math, wave, random
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 from moviepy import VideoClip, AudioFileClip
 
-# ── Paths ──────────────────────────────────────────────────────
+# -- Paths --
 FONT_BOLD = "C:/Windows/Fonts/consolab.ttf"
 FONT_REG  = "C:/Windows/Fonts/consola.ttf"
-LOGO_PATH = "assets/BuckitLogoTransparent.png"
+BUCKIT_TEXT_PATH = "assets/BUCKIT_TEXT.png"
+QR_PATH   = "assets/GooglePlayQR.png"
 SOUND_DIR = "assets/sounds"
 OUTPUT_DIR = "output"
 
-FPS          = 30
-BASE_CPS     = 7.5        # slightly faster
-PRE_PAUSE    = 0.40       # shorter wait before typing
-POST_HOLD    = 0.70       # shorter hold after done
-XFADE        = 0.20       # slide transition duration
-CURSOR_BLINK = 0.40
-LOGO_DUR     = 3.5
-SR           = 44100
+FPS         = 30
+PRE_PAUSE   = 0.45
+POST_HOLD   = 0.85
+GLITCH_DUR  = 0.35
+LOGO_DUR    = 8.0
+SR          = 44100
 
-PROMPT = "buckit~ > "
+# -- Scene 1: Dark purple terminal (the problem) --
+SCENE1_BG          = (28, 15, 52)        # dark purple
+SCENE1_USER_TEXT   = (180, 155, 235)     # lighter purple for user
+SCENE1_USER_PROMPT = (110, 85, 170)      # mid purple prompt
+SCENE1_BOT_TEXT    = (255, 220, 80)      # warm yellow for buckit
+SCENE1_BOT_PROMPT  = (180, 150, 50)      # dim yellow prompt
+SCENE1_CURSOR      = (180, 155, 235)
+SCENE1_HIGHLIGHT   = (255, 204, 0)
+SCENE1_RAM_FG      = (255, 80, 80)       # red for "full" RAM bar
+SCENE1_RAM_DIM     = (70, 50, 95)        # dim bar background
 
-LINES = [
-    "Good idea...",
-    "...wrong time?",
-    "Buck it in now...",
-    "...Buck it out later!",
+# -- Scene 2: Green terminal inverted (medium green bg, dark green text) --
+SCENE2_BG          = (0, 140, 75)        # v2 prompt green as bg
+SCENE2_USER_TEXT   = (4, 14, 10)         # v2 dark edge color as text
+SCENE2_USER_PROMPT = (8, 50, 30)         # slightly lighter dark green
+SCENE2_BOT_TEXT    = (220, 255, 60)      # bright yellow-green for buckit
+SCENE2_BOT_PROMPT  = (150, 190, 40)      # dimmer yellow-green
+SCENE2_CURSOR      = (4, 14, 10)
+SCENE2_HIGHLIGHT   = (255, 220, 0)       # yellow highlight
+SCENE2_RAM_FG      = (4, 14, 10)         # dark green RAM bar
+SCENE2_RAM_DIM     = (0, 100, 55)
+
+# -- Logo slide --
+LOGO_BG         = (18, 15, 48)
+LOGO_SUB_CLR    = (200, 195, 230)
+LOGO_BADGE_CLR  = (255, 220, 80)        # yellow for blinking text
+
+SCENE_THEMES = [
+    {"bg": SCENE1_BG,
+     "user_text": SCENE1_USER_TEXT, "user_prompt": SCENE1_USER_PROMPT,
+     "bot_text": SCENE1_BOT_TEXT, "bot_prompt": SCENE1_BOT_PROMPT,
+     "cursor": SCENE1_CURSOR, "highlight": SCENE1_HIGHLIGHT,
+     "ram_fg": SCENE1_RAM_FG, "ram_dim": SCENE1_RAM_DIM},
+    {"bg": SCENE2_BG,
+     "user_text": SCENE2_USER_TEXT, "user_prompt": SCENE2_USER_PROMPT,
+     "bot_text": SCENE2_BOT_TEXT, "bot_prompt": SCENE2_BOT_PROMPT,
+     "cursor": SCENE2_CURSOR, "highlight": SCENE2_HIGHLIGHT,
+     "ram_fg": SCENE2_RAM_FG, "ram_dim": SCENE2_RAM_DIM},
 ]
 
-# ── Scene themes: flat backgrounds, escalating energy ──────────
-THEMES = [
-    {   # 1 — dark teal, muted
-        "bg": (8, 22, 18),
-        "prompt": (0, 100, 55), "text": (0, 200, 110),
-        "cursor": (0, 200, 110),
-        "zoom_range": (1.0, 1.03),
+# -- Prompts --
+USER_PROMPT   = "busy_user123> "
+BUCKIT_PROMPT = "buckit> "
+
+# -- RAM bar config --
+# Shown after user lines; scene 1 shows RAM filling up, scene 2 shows RAM freeing
+RAM_BAR_WIDTH = 20  # chars
+RAM_DISPLAY_DUR = 0.8  # seconds the bar animates after user finishes typing
+
+# -- 2-scene dialogue structure --
+SCENE_DEFS = [
+    {   # Scene 1: THE PROBLEM — dark navy
+        "lines": [
+            {"text": "Good idea!",        "highlights": [], "who": "user"},
+            {"text": "(* - *)b",           "highlights": [], "who": "buckit"},
+            {"text": "But wrong time...",  "highlights": [], "who": "user"},
+            {"text": ":/",                 "highlights": [], "who": "buckit"},
+        ],
+        "typing_cps": [10, 14, 8.5, 14],
+        "inter_line_pause": [0.35, 0.30, 0.45],
+        # RAM bars after user lines (line index -> bar config)
+        "ram_bars": {
+            0: {"start_pct": 72, "end_pct": 85, "label": "BRAIN RAM"},
+            2: {"start_pct": 85, "end_pct": 98, "label": "BRAIN RAM"},
+        },
     },
-    {   # 2 — dark warm, muted
-        "bg": (28, 14, 8),
-        "prompt": (150, 95, 28), "text": (220, 165, 45),
-        "cursor": (220, 165, 45),
-        "zoom_range": (1.0, 1.035),
-    },
-    {   # 3 — deep navy, vivid (Buckit blue)
-        "bg": (10, 16, 42),
-        "prompt": (55, 120, 210), "text": (95, 195, 255),
-        "cursor": (95, 195, 255),
-        "zoom_range": (1.0, 1.045),
-    },
-    {   # 4 — deep purple, bold gold
-        "bg": (25, 14, 42),
-        "prompt": (190, 150, 35), "text": (255, 220, 60),
-        "cursor": (255, 220, 60),
-        "zoom_range": (1.0, 1.055),
+    {   # Scene 2: THE SOLUTION — dark green
+        "lines": [
+            {"text": "Buck it in now! >>",    "highlights": [(0, 7)], "who": "buckit"},
+            {"text": "O_O !",                  "highlights": [],       "who": "user"},
+            {"text": "Buck it out later! :D",  "highlights": [(0, 7)], "who": "buckit"},
+            {"text": "\\(^ o ^)/ !!",          "highlights": [],       "who": "user"},
+        ],
+        "typing_cps": [10.5, 16, 9, 16],
+        "inter_line_pause": [0.30, 0.35, 0.25],
+        "ram_bars": {
+            1: {"start_pct": 98, "end_pct": 45, "label": "BRAIN RAM"},
+            3: {"start_pct": 45, "end_pct": 12, "label": "BRAIN RAM"},
+        },
     },
 ]
 
 OUTPUTS = {
-    "story_9x16":   (1080, 1920),
-    "standard_4x3": (1440, 1080),
-    "portrait_3x4": (1080, 1440),
+    "story_9x16": (1080, 1920),
+    "feed_4x5":   (1080, 1350),
 }
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  Sound — real tactile samples
+#  Sound
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-def _load_mp3_as_array(path):
-    """Load mp3 via moviepy, return mono float32 array at SR."""
+def _load_mp3(path):
     clip = AudioFileClip(path)
-    # get raw audio frames
-    frames = []
-    for chunk in clip.iter_frames(fps=SR, dtype="float32"):
-        frames.append(chunk)
+    frames = list(clip.iter_frames(fps=SR, dtype="float32"))
     clip.close()
     arr = np.concatenate(frames)
     if arr.ndim == 2:
-        arr = arr.mean(axis=1)  # stereo → mono
+        arr = arr.mean(axis=1)
     return arr.astype(np.float32)
 
 
 def _load_sounds():
-    """Load all tactile sound variants."""
     keys = []
     for i in range(1, 5):
         p = os.path.join(SOUND_DIR, f"tactile{i}.mp3")
         if os.path.exists(p):
-            keys.append(_load_mp3_as_array(p))
-    space = None
+            keys.append(_load_mp3(p))
+    space = enter = None
     sp = os.path.join(SOUND_DIR, "tactile_space.mp3")
     if os.path.exists(sp):
-        space = _load_mp3_as_array(sp)
-    return keys, space
+        space = _load_mp3(sp)
+    ep = os.path.join(SOUND_DIR, "tactile_enter.mp3")
+    if os.path.exists(ep):
+        enter = _load_mp3(ep)
+    return keys, space, enter
 
 
-print("  Loading tactile sounds...")
-_KEY_SOUNDS, _SPACE_SOUND = _load_sounds()
-print(f"    {len(_KEY_SOUNDS)} key variants loaded")
+print("  Loading sounds...")
+_KEY_SOUNDS, _SPACE_SOUND, _ENTER_SOUND = _load_sounds()
+print(f"    {len(_KEY_SOUNDS)} key + space + enter loaded")
 
 
-def build_audio(total_dur, keystroke_events):
-    """keystroke_events: list of (time, char)"""
+def _pitch_shift(snd, factor):
+    n = len(snd)
+    new_n = max(1, int(n / factor))
+    return snd[np.linspace(0, n - 1, new_n).astype(int)]
+
+
+def build_audio(total_dur, ks_events):
     n = int(total_dur * SR)
     audio = np.zeros(n, dtype=np.float32)
-    for kt, ch in keystroke_events:
-        if ch == " " and _SPACE_SOUND is not None:
-            snd = _SPACE_SOUND.copy()
+    for kt, ch in ks_events:
+        if ch == "enter" and _ENTER_SOUND is not None:
+            snd = _ENTER_SOUND.copy() * random.uniform(0.7, 0.9)
+        elif ch == " " and _SPACE_SOUND is not None:
+            snd = _SPACE_SOUND.copy() * random.uniform(0.75, 1.0)
         elif _KEY_SOUNDS:
             snd = random.choice(_KEY_SOUNDS).copy()
+            snd = _pitch_shift(snd, random.uniform(0.92, 1.08))
+            snd *= random.uniform(0.75, 1.0)
         else:
             continue
-        # slight pitch variation via resampling
-        factor = random.uniform(0.92, 1.08)
-        if abs(factor - 1.0) > 0.02:
-            new_n = max(1, int(len(snd) / factor))
-            idx = np.linspace(0, len(snd) - 1, new_n).astype(int)
-            snd = snd[idx]
-        vol = random.uniform(0.75, 1.0)
-        snd *= vol
         p = int(kt * SR)
         e = min(p + len(snd), n)
         if p < n:
             audio[p:e] += snd[:e - p]
-    # normalize peak to 0.85
     pk = np.max(np.abs(audio))
     if pk > 0:
-        audio = audio / pk * 0.85
+        audio = audio / pk * 0.82
     return np.clip(audio, -1, 1)
 
 
@@ -150,50 +198,94 @@ def save_wav(data, path):
 #  Typing rhythm
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-def _char_times(line):
+def _char_times(line, cps):
     times = [0.0]
-    base = 1.0 / BASE_CPS
+    base = 1.0 / cps
     for i in range(len(line) - 1):
         ch = line[i]
         d = base
-        if ch == "." and i + 1 < len(line) and line[i + 1] == ".":
-            d *= random.uniform(0.40, 0.65)
+        if i < 2:
+            d *= random.uniform(1.3, 1.6)
+        elif ch == "." and i + 1 < len(line) and line[i + 1] == ".":
+            d *= random.uniform(0.40, 0.60)
         elif ch == " ":
-            d *= random.uniform(1.2, 1.6)
-        elif ch in ".!?":
-            d *= random.uniform(1.3, 1.8)
+            d *= random.uniform(1.15, 1.5)
+        elif ch in ".!?:":
+            d *= random.uniform(1.2, 1.7)
+        elif ch in ">/<()^*_\\":
+            d *= random.uniform(0.5, 0.75)
         else:
-            d *= random.uniform(0.7, 1.2)
+            d *= random.uniform(0.70, 1.15)
         times.append(times[-1] + d)
     return times
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  Timeline
+#  Timeline planner
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def plan():
-    scenes, ks_events = [], []
+    phases = []
+    ks_events = []
     t = 0.0
-    for i, line in enumerate(LINES):
-        ct = _char_times(line)
-        td = ct[-1] + 1.0 / BASE_CPS
-        s_start = t
-        ts = t + PRE_PAUSE
-        te = ts + td
-        s_end = te + POST_HOLD
-        for ci, c in enumerate(ct):
-            ks_events.append((ts + c, line[ci]))
-        scenes.append(dict(idx=i, line=line, theme=THEMES[i],
-                           ct=ct, start=s_start, ts=ts, te=te, end=s_end))
-        t = s_end
+
+    for si, sdef in enumerate(SCENE_DEFS):
+        scene_start = t
+        lines_info = []
+
+        for li, ldef in enumerate(sdef["lines"]):
+            text = ldef["text"]
+            cps = sdef["typing_cps"][li]
+
+            if li == 0:
+                type_start = t + PRE_PAUSE
+            else:
+                pause = sdef["inter_line_pause"][li - 1]
+                t += pause
+                ks_events.append((t, "enter"))
+                type_start = t + 0.08
+
+            ct = _char_times(text, cps)
+            type_end = type_start + ct[-1] + 1.0 / cps
+
+            for ci, c_t in enumerate(ct):
+                ks_events.append((type_start + c_t, text[ci]))
+
+            # If this line has a RAM bar, add extra time for animation
+            has_ram = li in sdef.get("ram_bars", {})
+            ram_end = type_end + RAM_DISPLAY_DUR if has_ram else type_end
+
+            lines_info.append({
+                "text": text,
+                "highlights": ldef.get("highlights", []),
+                "who": ldef.get("who", "user"),
+                "type_start": type_start,
+                "type_end": type_end,
+                "ram_end": ram_end,
+                "ct": ct,
+                "ram_bar": sdef.get("ram_bars", {}).get(li),
+            })
+            t = ram_end
+
+        scene_end = t + POST_HOLD
+        phases.append({"type": "scene", "idx": si, "start": scene_start,
+                        "end": scene_end, "lines": lines_info})
+        t = scene_end
+
+        if si < len(SCENE_DEFS) - 1:
+            phases.append({"type": "glitch", "start": t, "end": t + GLITCH_DUR,
+                           "from_idx": si, "to_idx": si + 1})
+            t += GLITCH_DUR
+
     logo_start = t + 0.05
+    phases.append({"type": "logo", "start": logo_start, "end": logo_start + LOGO_DUR})
     total = logo_start + LOGO_DUR
-    return scenes, ks_events, logo_start, total
+
+    return phases, ks_events, total
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  Rendering
+#  Rendering helpers
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 _font_cache = {}
@@ -209,7 +301,6 @@ def _font(sz, bold=True):
 
 
 def _flat_bg(W, H, color):
-    """Simple flat colour background — no gradient artifacts."""
     bg = np.empty((H, W, 3), dtype=np.uint8)
     bg[:, :, 0] = color[0]
     bg[:, :, 1] = color[1]
@@ -218,22 +309,16 @@ def _flat_bg(W, H, color):
 
 
 def _fit_font(W, text, ratio=0.94):
-    """Find biggest font size that fits text in ratio*W."""
-    tw_target = int(W * ratio)
     lo, hi, best = 20, 250, 40
     while lo <= hi:
         mid = (lo + hi) // 2
         bb = _font(mid).getbbox(text)
         tw = bb[2] - bb[0] if bb else mid * len(text)
-        if tw <= tw_target:
+        if tw <= int(W * ratio):
             best = mid; lo = mid + 1
         else:
             hi = mid - 1
     return best
-
-
-def _ease_out_cubic(t):
-    return 1 - (1 - t) ** 3
 
 
 def _ease_out_back(t):
@@ -241,134 +326,287 @@ def _ease_out_back(t):
     return 1 + c3 * ((t - 1) ** 3) + c1 * ((t - 1) ** 2)
 
 
-def _ease_in_out_cubic(t):
-    if t < 0.5:
-        return 4 * t * t * t
-    else:
-        return 1 - ((-2 * t + 2) ** 3) / 2
+def _ease_out_cubic(t):
+    return 1 - (1 - t) ** 3
 
 
-def _apply_zoom(frame_arr, W, H, zoom, cx_offset=0, cy_offset=0):
-    """Zoom into frame with optional centre offset for tracking."""
-    if zoom <= 1.001 and abs(cx_offset) < 1 and abs(cy_offset) < 1:
-        return frame_arr
-    img = Image.fromarray(frame_arr)
-    zw, zh = int(W * zoom), int(H * zoom)
-    img = img.resize((zw, zh), Image.BILINEAR)
-    # offset the crop centre
-    cx = zw // 2 + int(cx_offset * zoom)
-    cy = zh // 2 + int(cy_offset * zoom)
-    # clamp
-    left = max(0, min(cx - W // 2, zw - W))
-    top  = max(0, min(cy - H // 2, zh - H))
-    img = img.crop((left, top, left + W, top + H))
-    result = np.asarray(img).copy()
-    del img
-    return result
+def _colored_segments(visible, highlights, text_color, highlight_color):
+    if not highlights or not visible:
+        return [(visible, text_color)]
+    colors = [text_color] * len(visible)
+    for s, e in highlights:
+        for i in range(max(0, s), min(e, len(visible))):
+            colors[i] = highlight_color
+    segs, i = [], 0
+    while i < len(visible):
+        c = colors[i]
+        j = i + 1
+        while j < len(visible) and colors[j] == c:
+            j += 1
+        segs.append((visible[i:j], c))
+        i = j
+    return segs
 
 
-def render_typing(W, H, bg, theme, typed, cursor_on, fsz):
-    """Clean render: flat bg + prompt + typed text. No outline, no glow."""
+def _apply_crt_scanlines(frame):
+    """CRT scanlines: darken every 2nd row strongly for visible effect."""
+    frame[1::2] = (frame[1::2].astype(np.uint16) * 140 >> 8).astype(np.uint8)
+    return frame
+
+
+def _draw_ram_bar(draw, x, y, font, progress, start_pct, end_pct, label, fg_color, dim_color):
+    """Draw a terminal-style progress bar: [########    ] 92% BRAIN RAM"""
+    current_pct = start_pct + (end_pct - start_pct) * progress
+    current_pct = max(0, min(100, current_pct))
+    filled = int(RAM_BAR_WIDTH * current_pct / 100)
+    empty = RAM_BAR_WIDTH - filled
+
+    bar_str = "[" + "#" * filled + " " * empty + "]"
+    pct_str = f" {int(current_pct)}% {label}"
+
+    # Draw bar in color
+    draw.text((x, y), bar_str, fill=fg_color, font=font)
+    bb = font.getbbox(bar_str)
+    bx = x + (bb[2] - bb[0])
+    draw.text((bx, y), pct_str, fill=dim_color, font=font)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  Scene rendering
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def render_scene(W, H, bg, phase, t, fsz, x_start, theme):
+    vis_lines = []
+    cursor_li = -1
+
+    for li, ln in enumerate(phase["lines"]):
+        if t >= ln["type_start"]:
+            if t < ln["type_end"]:
+                elapsed = t - ln["type_start"]
+                n = sum(1 for c in ln["ct"] if c <= elapsed)
+            else:
+                n = len(ln["text"])
+            vis_lines.append((ln["text"], n, ln["highlights"], ln["who"], li, ln))
+            cursor_li = len(vis_lines) - 1
+        elif t >= ln["type_start"] - 0.08 and li > 0:
+            vis_lines.append((ln["text"], 0, ln["highlights"], ln["who"], li, ln))
+            cursor_li = len(vis_lines) - 1
+
+    if not vis_lines:
+        first_who = phase["lines"][0]["who"] if phase["lines"] else "user"
+        vis_lines = [("", 0, [], first_who, 0, phase["lines"][0] if phase["lines"] else None)]
+        cursor_li = 0
+
+    is_typing = any(ln["type_start"] <= t < ln["type_end"] for ln in phase["lines"])
+    cursor_on = True if is_typing else (int(t * 4) % 2 == 0)
+
     frame = bg.copy()
     img = Image.fromarray(frame)
     draw = ImageDraw.Draw(img)
     mf = _font(fsz)
-    cursor_ch = "\u2588" if cursor_on else " "
-    full = PROMPT + typed + cursor_ch
+    sf = _font(max(16, int(fsz * 0.65)), bold=False)  # smaller font for RAM bar
 
-    bb = mf.getbbox(full)
-    tw, th = bb[2] - bb[0], bb[3] - bb[1]
-    tx, ty = (W - tw) // 2, (H - th) // 2
+    test_bb = mf.getbbox("Mg|")
+    line_h = test_bb[3] - test_bb[1]
+    line_spacing = int(line_h * 1.55)
+    small_bb = sf.getbbox("Mg|")
+    small_h = small_bb[3] - small_bb[1]
+    ram_spacing = int(small_h * 1.3)
 
-    # prompt in dim colour
-    draw.text((tx, ty), PROMPT, fill=theme["prompt"], font=mf)
-    # typed text + cursor in bright colour
-    pbb = mf.getbbox(PROMPT)
-    pw = pbb[2] - pbb[0] if pbb else 0
-    draw.text((tx + pw, ty), typed + cursor_ch, fill=theme["text"], font=mf)
+    # Calculate total block height including RAM bars
+    max_lines = len(phase["lines"])
+    # Count how many RAM bars we'll show
+    n_ram_bars = sum(1 for ln in phase["lines"] if ln.get("ram_bar") is not None)
+    total_block_h = line_h + (max_lines - 1) * line_spacing + n_ram_bars * ram_spacing
+    y_start = (H - total_block_h) // 2
+
+    y = y_start
+    for vi, (text, n_typed, highlights, who, orig_li, ln_data) in enumerate(vis_lines):
+        x = x_start
+
+        # Pick colors based on who's speaking
+        if who == "buckit":
+            prompt = BUCKIT_PROMPT
+            prompt_color = theme["bot_prompt"]
+            text_color = theme["bot_text"]
+        else:
+            prompt = USER_PROMPT
+            prompt_color = theme["user_prompt"]
+            text_color = theme["user_text"]
+
+        draw.text((x, y), prompt, fill=prompt_color, font=mf)
+        pbb = mf.getbbox(prompt)
+        px = x + (pbb[2] - pbb[0])
+
+        visible = text[:n_typed]
+        for seg_text, seg_color in _colored_segments(visible, highlights,
+                                                      text_color, theme["highlight"]):
+            draw.text((px, y), seg_text, fill=seg_color, font=mf)
+            sbb = mf.getbbox(seg_text)
+            px += sbb[2] - sbb[0]
+
+        # Cursor on current line
+        if vi == cursor_li:
+            c_ch = "\u2588" if cursor_on else " "
+            cursor_color = theme["cursor"]
+            draw.text((px, y), c_ch, fill=cursor_color, font=mf)
+
+        y += line_spacing
+
+        # RAM bar after this line if applicable
+        if ln_data and ln_data.get("ram_bar") and t >= ln_data["type_end"]:
+            ram = ln_data["ram_bar"]
+            ram_progress = min((t - ln_data["type_end"]) / RAM_DISPLAY_DUR, 1.0)
+            ram_progress = _ease_out_cubic(ram_progress)
+            _draw_ram_bar(draw, x_start, y - line_spacing + int(line_h * 1.15),
+                         sf, ram_progress,
+                         ram["start_pct"], ram["end_pct"], ram["label"],
+                         theme["ram_fg"], theme["ram_dim"])
+            y += ram_spacing
 
     result = np.asarray(img).copy()
     del img, draw
     return result
 
 
-def _get_typed_text_x_range(W, typed, fsz):
-    """Get horizontal pixel range of just the typed text (excluding prompt)."""
-    mf = _font(fsz)
-    full_with_cursor = PROMPT + typed + "\u2588"
-    full_bb = mf.getbbox(full_with_cursor)
-    full_w = full_bb[2] - full_bb[0] if full_bb else 0
-    prompt_bb = mf.getbbox(PROMPT)
-    prompt_w = prompt_bb[2] - prompt_bb[0] if prompt_bb else 0
-    typed_bb = mf.getbbox(typed + "\u2588") if typed else None
-    typed_w = typed_bb[2] - typed_bb[0] if typed_bb else 0
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  Glitch transition
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-    # text is centred: tx = (W - full_w) // 2
-    tx = (W - full_w) // 2
-    # typed text starts at tx + prompt_w
-    typed_start_x = tx + prompt_w
-    typed_end_x = typed_start_x + typed_w
-    typed_cx = (typed_start_x + typed_end_x) // 2
-    return typed_cx
+def _glitch(frame, intensity):
+    h, w = frame.shape[:2]
+    out = frame.copy()
+    shift = max(1, int(intensity * 18))
+
+    if shift < w:
+        out[:, :-shift, 0] = frame[:, shift:, 0]
+        out[:, shift:, 2]  = frame[:, :-shift, 2]
+
+    n_lines = max(1, int(intensity * 12))
+    for _ in range(n_lines):
+        y = random.randint(0, h - 1)
+        band = random.randint(1, max(1, int(intensity * 8)))
+        off = random.randint(-int(intensity * 30), int(intensity * 30))
+        y2 = min(y + band, h)
+        if 0 < abs(off) < w:
+            row_block = out[y:y2].copy()
+            if off > 0:
+                out[y:y2, off:] = row_block[:, :-off]
+                out[y:y2, :off] = 0
+            else:
+                out[y:y2, :off] = row_block[:, -off:]
+                out[y:y2, off:] = 0
+
+    flicker = np.float32(1.0 + (random.random() - 0.5) * intensity * 0.7)
+    out = np.clip(out.astype(np.float32) * flicker, 0, 255).astype(np.uint8)
+    return out
 
 
-def render_logo(W, H, t_in, logo_img, logo_bg):
-    """Bounce-in logo, staggered text."""
-    img = Image.fromarray(logo_bg.copy()).convert("RGBA")
+def render_glitch(frame_a, frame_b, progress, W, H):
+    intensity = math.sin(progress * math.pi)
+    alpha = int(min(progress * 1.8, 1.0) * 255)
+    blended = ((frame_a.astype(np.uint16) * (255 - alpha)
+              + frame_b.astype(np.uint16) * alpha) >> 8).astype(np.uint8)
+    return _glitch(blended, intensity)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  Logo end card — BUCKIT_TEXT.png + subtitle + QR + blinking text
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def render_logo(W, H, t_in, buckit_text_img, logo_bg_arr, qr_img):
+    img = Image.fromarray(logo_bg_arr.copy()).convert("RGBA")
     draw = ImageDraw.Draw(img)
 
-    logo_anim_dur = 0.6
-    title_start = 0.4
-    sub_start = 0.7
-    badge_start = 1.0
+    # Timing
+    text_img_t = 0.3    # BUCKIT_TEXT.png appears
+    sub_t = 0.6         # subtitle appears
+    qr_t = 0.9          # QR code appears
+    badge_t = 1.3       # blinking text appears
 
-    if logo_img is not None:
-        lsz_base = min(W, H) // 3
-        if t_in < logo_anim_dur:
-            p = t_in / logo_anim_dur
-            scale = _ease_out_back(p)
-            opacity = _ease_out_cubic(min(p * 2, 1.0))
-        else:
-            scale, opacity = 1.0, 1.0
-        lsz = max(1, int(lsz_base * scale))
-        lr = logo_img.resize((lsz, lsz), Image.LANCZOS).convert("RGBA")
-        a = lr.split()[3].point(lambda p: int(p * opacity))
-        lr.putalpha(a)
-        lx = (W - lsz) // 2
-        ly_base = (H - lsz_base) // 2 - int(H * 0.10)
-        ly = ly_base + (lsz_base - lsz) // 2
-        img.paste(lr, (lx, ly), lr)
-        del lr, a
-    else:
-        lsz_base, ly_base = 0, H // 2
+    # Layout: everything vertically centered
+    # Estimate total block height to center it
+    text_img_h = 0
+    text_img_w = 0
+    if buckit_text_img is not None:
+        # Scale to ~60% of width
+        scale = (W * 0.60) / buckit_text_img.width
+        text_img_w = int(buckit_text_img.width * scale)
+        text_img_h = int(buckit_text_img.height * scale)
 
-    def _fade(c, start_t):
+    sf = _font(int(min(W, H) * 0.032), bold=False)
+    sub_bb = sf.getbbox("Brain's External RAM")
+    sub_h = sub_bb[3] - sub_bb[1]
+
+    qr_sz = min(W, H) // 3
+
+    gf = _font(int(min(W, H) * 0.026), bold=True)
+    badge_bb = gf.getbbox("Available on Google Play")
+    badge_h = badge_bb[3] - badge_bb[1]
+
+    gap1 = int(H * 0.03)   # between logo text and subtitle
+    gap2 = int(H * 0.03)   # between subtitle and QR
+    gap3 = int(H * 0.025)  # between QR and badge text
+
+    total_h = text_img_h + gap1 + sub_h + gap2 + qr_sz + gap3 + badge_h
+    y_top = (H - total_h) // 2
+
+    def _fade_alpha(start_t):
         if t_in < start_t:
-            return (0, 0, 0, 0)
-        p = min((t_in - start_t) / 0.35, 1.0)
-        a = _ease_out_cubic(p)
-        return tuple(int(x * a) for x in c) + (255,)
+            return 0.0
+        return min((t_in - start_t) / 0.35, 1.0)
 
-    tf = _font(int(min(W, H) * 0.085))
-    title = "Buckit"
-    bb = tf.getbbox(title)
-    t_y = ly_base + lsz_base + int(H * 0.025)
-    draw.text(((W - (bb[2] - bb[0])) // 2, t_y), title,
-              fill=_fade((255, 220, 55), title_start), font=tf)
+    # 1. BUCKIT_TEXT.png
+    if buckit_text_img is not None and t_in >= text_img_t:
+        a = _fade_alpha(text_img_t)
+        scale_anim = _ease_out_back(min((t_in - text_img_t) / 0.5, 1.0)) if t_in < text_img_t + 0.5 else 1.0
+        cur_w = max(1, int(text_img_w * scale_anim))
+        cur_h = max(1, int(text_img_h * scale_anim))
+        resized = buckit_text_img.resize((cur_w, cur_h), Image.LANCZOS).convert("RGBA")
+        # Apply alpha
+        r, g, b, ra = resized.split()
+        ra = ra.point(lambda p: int(p * _ease_out_cubic(a)))
+        resized.putalpha(ra)
+        lx = (W - cur_w) // 2
+        ly = y_top + (text_img_h - cur_h) // 2
+        img.paste(resized, (lx, ly), resized)
+        del resized
 
-    sf = _font(int(min(W, H) * 0.030), bold=False)
-    sub = "Brain's External RAM"
-    bb2 = sf.getbbox(sub)
-    sy = t_y + int(H * 0.065)
-    draw.text(((W - (bb2[2] - bb2[0])) // 2, sy), sub,
-              fill=_fade((180, 170, 200), sub_start), font=sf)
+    cur_y = y_top + text_img_h + gap1
 
-    gf = _font(int(min(W, H) * 0.022), bold=False)
-    g = "Available on Google Play"
-    bb3 = gf.getbbox(g)
-    gy = sy + int(H * 0.055)
-    draw.text(((W - (bb3[2] - bb3[0])) // 2, gy), g,
-              fill=_fade((130, 125, 150), badge_start), font=gf)
+    # 2. Subtitle
+    if t_in >= sub_t:
+        a = _ease_out_cubic(_fade_alpha(sub_t))
+        sub_color = tuple(int(c * a) for c in LOGO_SUB_CLR) + (int(255 * a),)
+        sub_w = sub_bb[2] - sub_bb[0]
+        draw.text(((W - sub_w) // 2, cur_y), "Brain's External RAM",
+                  fill=sub_color, font=sf)
+
+    cur_y += sub_h + gap2
+
+    # 3. QR code
+    if qr_img is not None and t_in >= qr_t:
+        a = _ease_out_cubic(_fade_alpha(qr_t))
+        qr_resized = qr_img.resize((qr_sz, qr_sz), Image.LANCZOS).convert("RGBA")
+        r, g, b, qa = qr_resized.split()
+        qa = qa.point(lambda p: int(p * a))
+        qr_resized.putalpha(qa)
+        qr_x = (W - qr_sz) // 2
+        img.paste(qr_resized, (qr_x, cur_y), qr_resized)
+        del qr_resized
+
+    cur_y += qr_sz + gap3
+
+    # 4. Blinking "Available on Google Play"
+    if t_in >= badge_t:
+        # Blink at ~1.5Hz
+        blink_on = (int(t_in * 3) % 2 == 0)
+        if blink_on:
+            a = _ease_out_cubic(min((t_in - badge_t) / 0.3, 1.0))
+            badge_color = tuple(int(c * a) for c in LOGO_BADGE_CLR) + (int(255 * a),)
+            badge_w = badge_bb[2] - badge_bb[0]
+            draw.text(((W - badge_w) // 2, cur_y), "Available on Google Play",
+                      fill=badge_color, font=gf)
 
     result = np.asarray(img.convert("RGB")).copy()
     del img, draw
@@ -376,122 +614,78 @@ def render_logo(W, H, t_in, logo_img, logo_bg):
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  Slide transition helper
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-def _slide_transition(fa, fb, progress, W, H, direction="left"):
-    """Smooth slide: outgoing slides out, incoming slides in.
-    progress: 0→1. Uses ease_in_out for smooth acceleration."""
-    p = _ease_in_out_cubic(progress)
-    offset = int(W * p)
-    out = np.zeros((H, W, 3), dtype=np.uint8)
-    if direction == "left":
-        # fa slides left, fb slides in from right
-        if W - offset > 0:
-            out[:, :W - offset] = fa[:, offset:]
-        if offset > 0:
-            out[:, W - offset:] = fb[:, :offset]
-    else:
-        # fa slides right, fb slides in from left
-        if W - offset > 0:
-            out[:, offset:] = fa[:, :W - offset]
-        if offset > 0:
-            out[:, :offset] = fb[:, W - offset:]
-    return out
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  Video generation
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-# alternate slide directions for variety
-SLIDE_DIRS = ["left", "left", "left"]  # between scenes 1→2, 2→3, 3→4
-
-
 def generate(name, W, H):
     print(f"\n  [{name}] {W}x{H} ...")
-    scenes, ks_events, logo_start, total = plan()
+    phases, ks_events, total = plan()
 
     try:
-        logo_img = Image.open(LOGO_PATH).convert("RGBA")
+        buckit_text_img = Image.open(BUCKIT_TEXT_PATH).convert("RGBA")
     except Exception:
-        logo_img = None
+        buckit_text_img = None
 
-    longest = PROMPT + max(LINES, key=len) + "\u2588"
+    try:
+        qr_img = Image.open(QR_PATH).convert("RGBA")
+    except Exception:
+        qr_img = None
+
+    # Font size: fit longest possible display line (with prompt)
+    all_texts = []
+    for sd in SCENE_DEFS:
+        for l in sd["lines"]:
+            prompt = BUCKIT_PROMPT if l.get("who") == "buckit" else USER_PROMPT
+            all_texts.append(prompt + l["text"] + "\u2588")
+    # Also consider RAM bar text width
+    ram_text = "[" + "#" * RAM_BAR_WIDTH + "] 100% BRAIN RAM"
+    all_texts.append(ram_text)
+    longest = max(all_texts, key=len)
     fsz = _fit_font(W, longest, 0.94)
+
+    mf = _font(fsz)
+    longest_bb = mf.getbbox(longest)
+    longest_w = longest_bb[2] - longest_bb[0]
+    x_start = (W - longest_w) // 2
+
     print(f"    font: {fsz}px  duration: {total:.1f}s  frames: {int(total * FPS)}")
 
-    # flat backgrounds
-    bgs = [_flat_bg(W, H, th["bg"]) for th in THEMES]
-    logo_bg_color = (14, 10, 30)
-    logo_bg = _flat_bg(W, H, logo_bg_color)
+    print("    building backgrounds...")
+    scene_bgs = [_flat_bg(W, H, theme["bg"]) for theme in SCENE_THEMES]
+    logo_bg = _flat_bg(W, H, LOGO_BG)
+    gc.collect()
+
+    scene_phases = [p for p in phases if p["type"] == "scene"]
 
     frame_n = [0]
 
-    def _scene_frame(si, t, apply_zoom_effect=True):
-        sc = scenes[si]
-        th = sc["theme"]
-        line, ct = sc["line"], sc["ct"]
-
-        if t < sc["ts"]:
-            typed = ""
-        elif t >= sc["te"]:
-            typed = line
-        else:
-            elapsed = t - sc["ts"]
-            n = sum(1 for c in ct if c <= elapsed)
-            typed = line[:n]
-
-        cur = True if t < sc["te"] else (int(t / CURSOR_BLINK) % 2 == 0)
-
-        frame = render_typing(W, H, bgs[si], th, typed, cur, fsz)
-
-        if apply_zoom_effect and typed:
-            # Ken Burns base zoom
-            scene_dur = sc["end"] - sc["start"]
-            progress = (t - sc["start"]) / scene_dur if scene_dur > 0 else 0
-            z_lo, z_hi = th["zoom_range"]
-            zoom = z_lo + (z_hi - z_lo) * progress
-
-            # dynamic tracking: offset towards the cursor/latest typed char
-            typed_cx = _get_typed_text_x_range(W, typed, fsz)
-            screen_cx = W // 2
-            # smooth offset towards where typing is happening
-            cx_off = (typed_cx - screen_cx) * 0.15  # subtle tracking
-
-            frame = _apply_zoom(frame, W, H, zoom, cx_off, 0)
-
-        return frame
+    def _get_scene_frame(si, t):
+        return render_scene(W, H, scene_bgs[si], scene_phases[si], t, fsz,
+                           x_start, SCENE_THEMES[si])
 
     def make_frame(t):
         frame_n[0] += 1
-        if frame_n[0] % 100 == 0:
+        if frame_n[0] % 120 == 0:
             gc.collect()
 
-        # slide transition zones between scenes
-        for i in range(len(scenes) - 1):
-            fs = scenes[i]["end"] - XFADE
-            fe = scenes[i]["end"]
-            if fs <= t < fe:
-                progress = (t - fs) / XFADE
-                fa = _scene_frame(i, fe - 0.001, apply_zoom_effect=False)
-                fb = _scene_frame(i + 1, scenes[i + 1]["start"], apply_zoom_effect=False)
-                direction = SLIDE_DIRS[i] if i < len(SLIDE_DIRS) else "left"
-                return _slide_transition(fa, fb, progress, W, H, direction)
+        for phase in phases:
+            if phase["start"] <= t < phase["end"]:
+                if phase["type"] == "scene":
+                    frame = _get_scene_frame(phase["idx"], t)
+                    return _apply_crt_scanlines(frame)
 
-        # normal scene
-        for i, sc in enumerate(scenes):
-            s = sc["start"]
-            e = sc["end"] - (XFADE if i < len(scenes) - 1 else 0)
-            if s <= t < e:
-                return _scene_frame(i, t)
-            if i == len(scenes) - 1 and e <= t < sc["end"]:
-                return _scene_frame(i, t)
+                elif phase["type"] == "glitch":
+                    progress = (t - phase["start"]) / GLITCH_DUR
+                    fi, ti = phase["from_idx"], phase["to_idx"]
+                    fa = _get_scene_frame(fi, scene_phases[fi]["end"] - 0.001)
+                    fb = _get_scene_frame(ti, scene_phases[ti]["start"])
+                    frame = render_glitch(fa, fb, progress, W, H)
+                    del fa, fb
+                    return _apply_crt_scanlines(frame)
 
-        # logo end card
-        if t >= logo_start:
-            t_in = t - logo_start
-            return render_logo(W, H, t_in, logo_img, logo_bg)
+                elif phase["type"] == "logo":
+                    t_in = t - phase["start"]
+                    return render_logo(W, H, t_in, buckit_text_img, logo_bg, qr_img)
 
         return np.zeros((H, W, 3), dtype=np.uint8)
 
@@ -503,14 +697,25 @@ def generate(name, W, H):
     video = video.with_audio(AudioFileClip(wav))
 
     out = os.path.join(OUTPUT_DIR, f"buckit_promo_{name}.mp4")
-    video.write_videofile(out, fps=FPS, codec="libx264", audio_codec="aac",
+
+    codec = "libx264"
+    try:
+        import subprocess
+        r = subprocess.run(["ffmpeg", "-encoders"], capture_output=True, text=True)
+        if "h264_nvenc" in r.stdout:
+            codec = "h264_nvenc"
+            print(f"    using GPU encoder: {codec}")
+    except Exception:
+        pass
+
+    video.write_videofile(out, fps=FPS, codec=codec, audio_codec="aac",
                           preset="medium", bitrate="5000k", logger="bar")
     try:
         os.remove(wav)
     except OSError:
         pass
 
-    del bgs, logo_bg, video
+    del video
     gc.collect()
     print(f"    -> {out}")
     return out
@@ -518,18 +723,18 @@ def generate(name, W, H):
 
 def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    print("=" * 50)
-    print("  Buckit - Brain's External RAM  |  Promo v4")
-    print("=" * 50)
+    print("=" * 52)
+    print("  Buckit - Brain's External RAM  |  Promo v8")
+    print("=" * 52)
     results = []
     for name, (w, h) in OUTPUTS.items():
         results.append(generate(name, w, h))
         gc.collect()
-    print("\n" + "=" * 50)
+    print("\n" + "=" * 52)
     print("  Done!")
     for r in results:
         print(f"    {r}")
-    print("=" * 50)
+    print("=" * 52)
 
 
 if __name__ == "__main__":
