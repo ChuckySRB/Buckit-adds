@@ -1,0 +1,7 @@
+Make a CLI typing animation of this text:
+- Good idea... 
+- ...wrong time? 
+- Buck it in now... 
+- ...Buck it out later!
+Add special caracthers as needed and animation elements to make the typed video cool. Each line is one cut sceen. You can have different color terminal for each line when typing the line for cooler animation. This will be used as a promotional video for Buckit mobile application. In the terminal just have slow typing of these 4 lines, nothing else. Make the typing in the midle of the screen, normal angle. For the sound, just use the satisfying keyboard press for each letter typed, noting else.
+can you use whatever resources you like, and python, to generate a short  video add (one in dimension for phone stories like isntagram, one with dimensions for other canels (maybe jsut 4:3 and 3:4) and render it using ffmpeg. you can put some of a personal spin on it as well
