@@ -14,10 +14,13 @@ Buckit - Brain's External RAM  ·  Promo Video Generator v7
   • Outputs: 9:16 (stories) + 4:5 (feed)
 """
 
-import os, gc, math, wave, random
+import os, gc, math, wave, random, time
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 from moviepy import VideoClip, AudioFileClip
+
+# Unique run tag so outputs never overwrite previous runs
+RUN_TAG = time.strftime("%Y%m%d_%H%M%S")
 
 # -- Paths --
 FONT_BOLD = "C:/Windows/Fonts/consolab.ttf"
@@ -33,6 +36,12 @@ POST_HOLD   = 0.85
 GLITCH_DUR  = 0.35
 LOGO_DUR    = 3.8
 SR          = 44100
+
+# -- Working animation before first idea --
+WORKING_TYPEIN  = 0.8   # seconds to type in "working..." text
+WORKING_DUR     = 2.5   # seconds the spinner runs AFTER type-in finishes
+WORKING_SPINNER = ['|', '/', '-', '\\']  # rotating slash chars
+WORKING_SPEED   = 6     # spins per second
 
 # -- Scene 1: Dark navy terminal (the problem) --
 SCENE1_BG          = (15, 20, 55)
@@ -54,11 +63,11 @@ SCENE2_BOT_PROMPT  = (180, 150, 50)      # dim yellow prompt
 SCENE2_CURSOR      = (0, 255, 140)
 SCENE2_HIGHLIGHT   = (255, 204, 0)
 SCENE2_RAM_FG      = (0, 200, 100)       # green for "freeing" RAM bar
-SCENE2_RAM_DIM     = (5, 25, 18)
+SCENE2_RAM_DIM     = (40, 120, 80)       # lighter so label text is visible
 
 # -- Logo slide --
 LOGO_BG         = (18, 15, 48)
-LOGO_SUB_CLR    = (200, 195, 230)
+LOGO_SUB_CLR    = (235, 230, 255)
 LOGO_BADGE_CLR  = (255, 220, 80)        # yellow for blinking text
 
 SCENE_THEMES = [
@@ -75,7 +84,7 @@ SCENE_THEMES = [
 ]
 
 # -- Prompts --
-USER_PROMPT   = "you> "
+USER_PROMPT   = "busy_user123> "
 BUCKIT_PROMPT = "buckit> "
 
 # -- RAM bar config --
@@ -86,6 +95,7 @@ RAM_DISPLAY_DUR = 0.8  # seconds the bar animates after user finishes typing
 # -- 2-scene dialogue structure --
 SCENE_DEFS = [
     {   # Scene 1: THE PROBLEM — dark navy
+        "working_pre": {"duration": WORKING_DUR},
         "lines": [
             {"text": "Good idea!",        "highlights": [], "who": "user"},
             {"text": "(* - *)b",           "highlights": [], "who": "buckit"},
@@ -97,7 +107,9 @@ SCENE_DEFS = [
         # RAM bars after user lines (line index -> bar config)
         "ram_bars": {
             0: {"start_pct": 72, "end_pct": 85, "label": "BRAIN RAM"},
-            2: {"start_pct": 85, "end_pct": 98, "label": "BRAIN RAM"},
+            2: {"start_pct": 85, "end_pct": 100, "label": "BRAIN RAM",
+                "error": "!! ERROR: BRAIN OVERLOADED !!",
+                "error_color": (255, 50, 100)},  # red/magenta blink
         },
     },
     {   # Scene 2: THE SOLUTION — dark green
@@ -233,6 +245,19 @@ def plan():
         scene_start = t
         lines_info = []
 
+        # Working pre-phase: type-in + spinner before first line
+        working_pre = sdef.get("working_pre")
+        working_end = None
+        if working_pre:
+            # Add keystroke sounds for typing "working..."
+            work_text = "working..."
+            work_cps = len(work_text) / WORKING_TYPEIN
+            work_ct = _char_times(work_text, work_cps)
+            for ci, c_t in enumerate(work_ct):
+                ks_events.append((t + c_t, work_text[ci]))
+            working_end = t + WORKING_TYPEIN + working_pre["duration"]
+            t = working_end
+
         for li, ldef in enumerate(sdef["lines"]):
             text = ldef["text"]
             cps = sdef["typing_cps"][li]
@@ -269,7 +294,9 @@ def plan():
 
         scene_end = t + POST_HOLD
         phases.append({"type": "scene", "idx": si, "start": scene_start,
-                        "end": scene_end, "lines": lines_info})
+                        "end": scene_end, "lines": lines_info,
+                        "working_pre": working_pre,
+                        "working_end": working_end})
         t = scene_end
 
         if si < len(SCENE_DEFS) - 1:
@@ -353,21 +380,34 @@ def _apply_crt_scanlines(frame):
     return frame
 
 
-def _draw_ram_bar(draw, x, y, font, progress, start_pct, end_pct, label, fg_color, dim_color):
+def _draw_ram_bar(draw, x, y, font, progress, start_pct, end_pct, label, fg_color, dim_color,
+                  error_text=None, error_color=None, t=0.0):
     """Draw a terminal-style progress bar: [########    ] 92% BRAIN RAM"""
     current_pct = start_pct + (end_pct - start_pct) * progress
     current_pct = max(0, min(100, current_pct))
     filled = int(RAM_BAR_WIDTH * current_pct / 100)
     empty = RAM_BAR_WIDTH - filled
 
+    # If error and bar is full, use error color for the bar too
+    bar_color = fg_color
+    if error_text and progress >= 1.0:
+        bar_color = error_color or fg_color
+
     bar_str = "[" + "#" * filled + " " * empty + "]"
     pct_str = f" {int(current_pct)}% {label}"
 
-    # Draw bar in color
-    draw.text((x, y), bar_str, fill=fg_color, font=font)
+    draw.text((x, y), bar_str, fill=bar_color, font=font)
     bb = font.getbbox(bar_str)
     bx = x + (bb[2] - bb[0])
     draw.text((bx, y), pct_str, fill=dim_color, font=font)
+
+    # Blinking error text below the bar when complete
+    if error_text and progress >= 1.0:
+        blink_on = int(t * 4) % 2 == 0  # blink at ~2Hz
+        if blink_on:
+            line_bb = font.getbbox("Mg|")
+            err_y = y + (line_bb[3] - line_bb[1]) + 4
+            draw.text((x, err_y), error_text, fill=error_color, font=font)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -375,6 +415,10 @@ def _draw_ram_bar(draw, x, y, font, progress, start_pct, end_pct, label, fg_colo
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def render_scene(W, H, bg, phase, t, fsz, x_start, theme):
+    working_pre = phase.get("working_pre")
+    working_end = phase.get("working_end")
+    in_working = working_pre and working_end and t < working_end
+
     vis_lines = []
     cursor_li = -1
 
@@ -391,7 +435,7 @@ def render_scene(W, H, bg, phase, t, fsz, x_start, theme):
             vis_lines.append((ln["text"], 0, ln["highlights"], ln["who"], li, ln))
             cursor_li = len(vis_lines) - 1
 
-    if not vis_lines:
+    if not vis_lines and not in_working:
         first_who = phase["lines"][0]["who"] if phase["lines"] else "user"
         vis_lines = [("", 0, [], first_who, 0, phase["lines"][0] if phase["lines"] else None)]
         cursor_li = 0
@@ -412,14 +456,67 @@ def render_scene(W, H, bg, phase, t, fsz, x_start, theme):
     small_h = small_bb[3] - small_bb[1]
     ram_spacing = int(small_h * 1.3)
 
-    # Calculate total block height including RAM bars
+    # Calculate total block height including RAM bars and working line
+    has_working = working_pre is not None
     max_lines = len(phase["lines"])
-    # Count how many RAM bars we'll show
     n_ram_bars = sum(1 for ln in phase["lines"] if ln.get("ram_bar") is not None)
-    total_block_h = line_h + (max_lines - 1) * line_spacing + n_ram_bars * ram_spacing
+    n_error_bars = sum(1 for ln in phase["lines"] if ln.get("ram_bar") and ln["ram_bar"].get("error"))
+    # Working line takes 1 line + 1 ram bar slot
+    extra_working = (line_spacing + ram_spacing) if has_working else 0
+    total_block_h = (line_h + (max_lines - 1) * line_spacing
+                     + n_ram_bars * ram_spacing
+                     + n_error_bars * ram_spacing  # extra line for error text
+                     + extra_working)
     y_start = (H - total_block_h) // 2
 
     y = y_start
+
+    # Draw working line (part of the scene, always first)
+    if has_working:
+        elapsed_total = t - phase["start"]
+        typein_end = WORKING_TYPEIN
+        spin_end = WORKING_TYPEIN + working_pre["duration"]
+
+        work_full = "working..."
+        prompt = USER_PROMPT
+
+        # Phase 1: type in "working..." char by char
+        if elapsed_total < typein_end:
+            frac = elapsed_total / typein_end
+            n_chars = int(frac * len(work_full))
+            work_visible = work_full[:n_chars]
+            spinner_ch = ""
+            # Show blinking cursor at end
+            if int(t * 6) % 2 == 0:
+                work_visible += "\u2588"
+        # Phase 2: spinner running
+        elif elapsed_total < spin_end:
+            work_visible = work_full + " "
+            spin_elapsed = elapsed_total - typein_end
+            spinner_idx = int(spin_elapsed * WORKING_SPEED) % len(WORKING_SPINNER)
+            spinner_ch = WORKING_SPINNER[spinner_idx]
+        # Phase 3: dialogue started — freeze spinner, show final state
+        else:
+            work_visible = work_full
+            spinner_ch = ""
+
+        draw.text((x_start, y), prompt, fill=theme["user_prompt"], font=mf)
+        pbb = mf.getbbox(prompt)
+        px = x_start + (pbb[2] - pbb[0])
+        draw.text((px, y), work_visible + spinner_ch, fill=theme["user_text"], font=mf)
+
+        y += line_spacing
+
+        # RAM bar — only starts filling once type-in is done
+        if elapsed_total >= typein_end:
+            ram_elapsed = elapsed_total - typein_end
+            work_progress = min(ram_elapsed / working_pre["duration"], 1.0)
+            _draw_ram_bar(draw, x_start, y - line_spacing + int(line_h * 1.15),
+                         sf, _ease_out_cubic(work_progress),
+                         55, 72, "BRAIN RAM",
+                         theme["ram_fg"], theme["ram_dim"])
+        y += ram_spacing
+
     for vi, (text, n_typed, highlights, who, orig_li, ln_data) in enumerate(vis_lines):
         x = x_start
 
@@ -460,8 +557,13 @@ def render_scene(W, H, bg, phase, t, fsz, x_start, theme):
             _draw_ram_bar(draw, x_start, y - line_spacing + int(line_h * 1.15),
                          sf, ram_progress,
                          ram["start_pct"], ram["end_pct"], ram["label"],
-                         theme["ram_fg"], theme["ram_dim"])
+                         theme["ram_fg"], theme["ram_dim"],
+                         error_text=ram.get("error"),
+                         error_color=ram.get("error_color"),
+                         t=t)
             y += ram_spacing
+            if ram.get("error"):
+                y += ram_spacing  # extra space for error line
 
     result = np.asarray(img).copy()
     del img, draw
@@ -636,9 +738,15 @@ def generate(name, W, H):
         for l in sd["lines"]:
             prompt = BUCKIT_PROMPT if l.get("who") == "buckit" else USER_PROMPT
             all_texts.append(prompt + l["text"] + "\u2588")
+    # Also consider working pre-phase text width
+    for sd in SCENE_DEFS:
+        if sd.get("working_pre"):
+            all_texts.append(USER_PROMPT + "working... /")
     # Also consider RAM bar text width
     ram_text = "[" + "#" * RAM_BAR_WIDTH + "] 100% BRAIN RAM"
     all_texts.append(ram_text)
+    # Error text is on its own line, also needs to fit
+    all_texts.append("!! ERROR: BRAIN OVERLOADED !!")
     longest = max(all_texts, key=len)
     fsz = _fit_font(W, longest, 0.94)
 
@@ -695,7 +803,7 @@ def generate(name, W, H):
     save_wav(build_audio(total, ks_events), wav)
     video = video.with_audio(AudioFileClip(wav))
 
-    out = os.path.join(OUTPUT_DIR, f"buckit_promo_{name}.mp4")
+    out = os.path.join(OUTPUT_DIR, f"buckit_promo_{name}_{RUN_TAG}.mp4")
 
     codec = "libx264"
     try:
